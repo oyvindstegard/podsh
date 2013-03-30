@@ -20,4 +20,7 @@ accompanying manual page, copy the file `podsh.1' to /usr/local/man/man1.
 Then simply run:
 $ podsh -h
 
-for help.
+for help. Or:
+$ man podsh
+
+for manual page.
