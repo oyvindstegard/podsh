@@ -1,0 +1,88 @@
+.\" -*- nroff -*-
+.\" First parameter, NAME, should be all caps
+.\" Second parameter, SECTION, should be 1-8, maybe w/ subsection
+.\" other parameters are allowed: see man(7), man(1)
+.TH PODSH 1 "30 March, 2013"
+.\" Please adjust this date whenever revising the manpage.
+.\"
+.\" Some roff macros, for reference:
+.\" .nh        disable hyphenation
+.\" .hy        enable hyphenation
+.\" .ad l      left justify
+.\" .ad b      justify to both left and right margins
+.\" .nf        disable filling
+.\" .fi        enable filling
+.\" .br        insert line break
+.\" .sp <n>    insert n+1 empty lines
+.\" for manpage-specific macros, see man(7)
+.SH NAME
+podsh \- a podcast downloader
+.SH SYNOPSIS
+.B podsh [\fIoptions\fR]
+.SH DESCRIPTION
+\fBpodsh\fP is a small podcast downloader written in \fBbash\fR. It is designed
+to be robust, quick and easy to use, and with automation in mind. Add some
+feeds, and then run it periodically (either manually or even better, from
+cron(8)), and you should be able to enjoy continuously updated podcast media
+files with minimal fuzz.
+.SH OPTIONS
+.TP
+.B \-a \fRURL [title] or OPML-FILE
+Add feed at URL. Optionally specify the desired title. If an OPML file is
+specified instead of a URL, then all feeds found in that file are \fBimported\fR.
+.TP
+.B \-u \fR[MATCH]
+Update all podcasts. Optionally specify a regular expression MATCH to only
+update feeds matching in title or URL.
+.TP
+.B \-l \fRN
+Limit number of downloaded entries per podcast to N. Default limit is 1;
+only download the most recent episode. Set to -1 for unlimited.
+Applies only when updating feeds.
+.TP
+.B \-e
+Expire old items/episodes according to limit set with \fB-l\fR N. If the number
+of items in the feed download dir exceeds the limit N, then the oldest files
+will be deleted. Applies only when updating feeds.
+.TP
+.B \-r \fRMATCH or OPML-FILE
+Remove feeds matching MATCH in url or title. If an OPML-FILE is specified, then
+all feeds found in that file are removed. Use \fB-X\fR to delete the local
+download dir associated with the feed(s) as well.
+.TP
+.B \-s
+Print list of subscribed podcasts.
+.TP
+.B \-S
+Print list of subscribed podcasts and check their status online.
+.TP
+.B \-O \fROPML-FILE
+Export current podcast subscriptions as XML to an OPML-FILE.
+.TP
+.B \-X
+Clean up local download dir by deleting podcasts that are no longer configured.
+Useful if you have removed podcasts from the config and would like to clean
+up.
+.TP
+.B \-d \fRDOWNLOAD-DIR
+Set the download directory. Can also be set through the environment variable
+`PODSH_DOWNLOAD_DIR'. Default is: ~/Podcasts
+
+Note: The feed configuration will be maintained in a file `.feeds.conf' under
+this directory.
+.SH EXAMPLES
+.TP
+Add a couple of feeds to config:
+$ podsh -a http://somewhere.com/feed.rss -a http://foo.feed.com/?rss "Foo Feed"
+.TP
+Update all feeds, download only the most recents item for each feed:
+$ podsh -u
+.TP
+Update feeds matching "bbc", download and keep at most 5 items for each feed, \
+older items are expired:
+$ podsh -u bbc -l5 -e
+.TP
+Remove feeds from config matching 'bbc.co.uk' and delete them from local cache:
+$ podsh -r bbc.co.uk -X
+.SH AUTHOR
+podsh was written by Øyvind Stegard <oyvind.stegard@ifi.uio.no>

@@ -1,0 +1,1254 @@
+#!/bin/bash
+# -*- coding: utf-8 -*-
+#
+# Podsh - A podcast downloader that does things the way its benevolent dictator
+#         wants.
+#
+#        Author: Øyvind Stegard <oyvind.stegard@ifi.uio.no>
+#        Copyright (C) 2010–2013 Øyvind Stegard.
+#
+################################################################################
+#                                   LICENSE
+# This program is free software: you can redistribute it and/or modify it under 
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+################################################################################
+#
+# Podsh is a command line podcast client written in BASH. It is designed to be
+# robust, quick and esay to use, and with automation in mind. Give it some
+# feeds, and then run it periodically (either manually or even better, from
+# cron), and you should be able to enjoy continuously updated podcast media
+# files with minimal fuzz.
+#
+# Features:
+# - Few and common dependencies: bash, curl, and xsltproc (libxslt).
+#   No installation procedure, there is only this script file.
+# - Robust feed parsing and tracking/handling of downloaded feed content.
+#   Supports both standard RSS feeds and Atom 1.0 feeds.
+# - Automatic cleanup of old content and removed podcast feeds (if you like to
+#   keep things tidy) and limiting number of new items to download.
+# - Automatic playlist maintenance per feed (chronological order by publication
+#   time).
+# - Configuration is simple and automatically managed using options for adding
+#   or removing feeds. It is also very easy to edit by hand. Everything
+#   needed is kept in the download directory (of your choice).
+# - Naming of downloaded media files using titles (if available in feed) and a
+#   timestamp prefix which gives proper chronological sorting order. Fallbacks
+#   to other methods of generating name for feeds with broken or sparse amounts
+#   of metadata in them.
+# - Locale encoding-aware, handles conversion of encoding for non-UTF-8 locales
+#   where appropriate.
+# - Every podcast feed gets its own directory under the download directory, and
+#   this directory simply contains all the media files and an automatically
+#   updated playlist. Easy to listen to directly, share on a file-server or
+#   synchronize to other places.
+# - Suitable to run from e.g. cron, to update local feed cache regularly. No need
+#   to keep a monster media manager application running to get new feed content
+#   downloaded.
+# - OPML file support. Import or remove all feeds found in an OPML-file, and
+#   export current configuration to an OPML-file.
+#
+# [Anti-features:
+# - It will not play any of the downloaded media files. The idea is that you use
+#   your own favorite media player software or device to listen to or view the
+#   podcast files.]
+#
+# Requirements:
+# - GNU Bash (tested from v3.2.15 and up).
+# - xsltproc (XML parsing)
+# - curl (command line HTTP client)
+#
+# Feel free to contact the author and report bugs or give suggestions for
+# improvements. The software has only been tested on Linux, so feedback on other
+# platforms (especially *BSD and MacOSX) is welcome.
+#
+
+readonly NAME=Podsh
+readonly VERSION=0.9.1
+readonly COMMIT=$(echo '$Format:%H$'|grep -v Format)
+readonly CMD=$(basename -- $0)
+
+readonly MEDIAFILE_TIMESTAMP_FORMAT='%Y%m%d-%H%M'
+readonly RFC2822_TIMESTAMP_FORMAT='%a, %d %b %Y %H:%M:%S %z'
+readonly CURL_COMMON_OPTS="-A $NAME/$VERSION -L"
+readonly CURL_FEED_DELAY_OPTS="--retry 3  --retry-delay 20 --connect-timeout 40 -y30"
+readonly CURL_MEDIA_DELAY_OPTS="--retry 3 --retry-delay 30 --connect-timeout 60 -y80"
+readonly CURL_SHORT_DELAY_OPTS="--retry 3 --retry-delay 5  --connect-timeout 10"
+readonly TAB='	' # A single TAB character
+
+# Check some needed pre-requisites
+check_prerequisites() {
+    type curl 1>/dev/null 2>&1 || { echo "Error: missing requirement: curl"; exit 255; }
+    type xsltproc 1>/dev/null 2>&1 || { echo "Error: missing requirement: xsltproc"; exit 255; }
+}
+
+# Returns non-zero code if XML is invalid or not a feed.
+# Takes 1 parameter: an XML file
+xml_is_valid_feed() {
+    (xsltproc - "$1" <<'EOF'
+<?xml version="1.0"?>
+<stylesheet version="1.0" xmlns="http://www.w3.org/1999/XSL/Transform" xmlns:atom="http://www.w3.org/2005/Atom">
+  <output method="text" encoding="UTF-8"/>
+  <template match="/">
+    <choose>
+      <when test="/rss/channel"><text>VALID</text></when>
+      <otherwise><if test="/atom:feed"><text>VALID</text></if></otherwise>
+    </choose>
+  </template>
+</stylesheet>
+EOF
+) 2>/dev/null|grep -Fq VALID
+}
+
+# Echoes the podcast channel title, output is UTF-8-encoded.
+# Takes 1 parameter: the feed XML file.
+xml_get_channel_title() {
+    xsltproc - "$1" 2>/dev/null <<'EOF'
+<?xml version="1.0"?>
+<stylesheet version="1.0" xmlns="http://www.w3.org/1999/XSL/Transform" xmlns:atom="http://www.w3.org/2005/Atom">
+  <output method="text" encoding="UTF-8"/>
+    <template match="/">
+      <choose>
+        <when test="/rss/channel">
+          <apply-templates select="/rss/channel"/>
+        </when>
+        <otherwise>
+          <if test="/atom:feed">
+            <apply-templates select="/atom:feed" />
+          </if>
+        </otherwise>
+      </choose>
+    </template>
+    <template match="/rss/channel">
+      <value-of select="normalize-space(title)"/><text>&#10;</text>
+    </template>
+    <template match="/atom:feed">
+      <value-of select="normalize-space(atom:title)"/><text>&#10;</text>
+    </template>
+</stylesheet>
+EOF
+}
+
+# Echoes the OPML file title, output is UTF-8-encoded.
+# Takes 1 parameter: the OPML XML file.
+xml_get_opml_title() {
+    xsltproc - "$1" 2>/dev/null <<'EOF'
+<?xml version="1.0"?>
+<stylesheet version="1.0" xmlns="http://www.w3.org/1999/XSL/Transform">
+  <output method="text" encoding="UTF-8"/>
+    <template match="/">
+      <apply-templates select="/opml/head/title"/>
+    </template>
+    <template match="title">
+      <value-of select="normalize-space(.)"/><text>&#10;</text>
+    </template>
+</stylesheet>
+EOF
+}
+
+# Echoes '<feed-URL>\t<feed-title>\n' for each feed present in an OPML outline document.
+# Output is UTF-8-encoded.
+# Takes 1 parameter: the OPML xml file.
+xml_get_opml_feeds() {
+    xsltproc - "$1" 2>/dev/null <<'EOF'
+<?xml version="1.0"?>
+<stylesheet version="1.0" xmlns="http://www.w3.org/1999/XSL/Transform">
+  <output method="text" encoding="UTF-8"/>
+    <template match="/">
+      <apply-templates select="/opml/body//outline"/>
+    </template>
+    <template match="outline">
+      <if test="@xmlUrl or @url">
+        <choose>
+          <when test="@xmlUrl">
+            <value-of select="translate(normalize-space(@xmlUrl), '&#9;', '')"/>
+          </when>
+          <when test="@url">
+            <value-of select="translate(normalize-space(@url), '&#9;', '')"/>
+          </when>
+        </choose>
+        <text>&#9;</text>
+        <value-of select="translate(normalize-space(@text), '&#9;', '')"/>
+        <text>&#10;</text>
+      </if>
+    </template>
+</stylesheet>
+EOF
+}
+
+# Echoes '<timestamp>\t<enclosure-URL>\t<media-type>\t<title>\t<guid>' for each item.
+# Items are sorted on publishing date descending (most recent first), or feed order
+# if publishing dates are unavailable.
+# Non-existant fields will be given the value '?', output is UTF-8-encoded.
+# Takes 1 parameter: the feed XML file.
+xml_get_channel_items() {
+    (xsltproc - "$1" <<'EOF'
+<?xml version="1.0"?>
+<stylesheet version="1.0" xmlns="http://www.w3.org/1999/XSL/Transform" xmlns:atom="http://www.w3.org/2005/Atom">
+  <output method="text" encoding="UTF-8"/>
+  <template match="/">
+    <choose>
+      <when test="/rss/channel">
+        <apply-templates select="/rss/channel/item"/>
+      </when>
+      <otherwise>
+        <if test="/atom:feed">
+          <apply-templates select="/atom:feed/atom:entry" />
+        </if>
+      </otherwise>
+    </choose>
+  </template>
+  <template match="item">
+    <if test="enclosure">
+      <call-template name="render">
+        <with-param name="pubDate" select="translate(normalize-space(pubDate), '&#9;','')" />
+        <with-param name="url" select="enclosure/@url" />
+        <with-param name="type" select="enclosure/@type" />
+        <with-param name="title" select="translate(normalize-space(title), '&#9;', '')" />
+        <with-param name="guid" select="translate(normalize-space(guid), '&#9;', '')" />
+      </call-template>
+    </if>
+  </template>
+  <template match="atom:entry">
+    <if test="atom:link[@rel = 'enclosure']">
+      <variable name="pubDate">
+        <choose>
+          <when test="atom:published"><value-of select="atom:published"/></when>
+          <otherwise><value-of select="atom:updated" /></otherwise>
+        </choose>
+      </variable>
+      <call-template name="render">
+        <with-param name="pubDate" select="translate(normalize-space($pubDate), '&#9;','')" />
+        <with-param name="url" select="atom:link[@rel = 'enclosure']/@href" />
+        <with-param name="type" select="atom:link[@rel = 'enclosure']/@type" />
+        <with-param name="title" select="translate(normalize-space(atom:title), '&#9;', '')" />
+        <with-param name="guid" select="translate(normalize-space(atom:id), '&#9;', '')" />
+      </call-template>
+    </if>
+  </template>
+  <template name="render">
+    <param name="pubDate"/>
+    <param name="url"/>
+    <param name="type"/>
+    <param name="title"/>
+    <param name="guid"/>
+    <choose>
+      <when test="$pubDate != ''"><value-of select="$pubDate"/></when>
+      <otherwise><text>?</text></otherwise>
+    </choose>
+    <text>&#9;</text>
+    <choose>
+      <when test="$url != ''"><value-of select="$url"/></when>
+      <otherwise><text>?</text></otherwise>
+    </choose>
+    <text>&#9;</text>
+    <choose>
+      <when test="$type != ''"><value-of select="$type"/></when>
+      <otherwise><text>?</text></otherwise>
+    </choose>
+    <text>&#9;</text>
+    <choose>
+      <when test="$title != ''"><value-of select="$title"/></when>
+      <otherwise><text>?</text></otherwise>
+    </choose>
+    <text>&#9;</text>
+    <choose>
+      <when test="$guid != ''"><value-of select="$guid"/></when>
+      <otherwise><text>?</text></otherwise>
+    </choose>
+    <text>&#10;</text>
+  </template>
+</stylesheet>
+EOF
+)  |  (while IFS=$TAB read pubDate url type title guid; do
+            timestamp=$(parse_date "$pubDate" "$MEDIAFILE_TIMESTAMP_FORMAT" 2>/dev/null) || timestamp='?'
+            url=${url// /%20}
+            echo "${timestamp}${TAB}${url}${TAB}${type}${TAB}${title}${TAB}${guid}"
+       done) | LC_ALL=C sort -k1,1 -sr
+}
+
+# Echoes an OPML XML file with current podcast subscriptions.
+# Output is UTF-8 encoded.
+xml_export_opml() {
+    [ -f "$CONFIG" ] || return 255
+    local name username
+    username=$(id -nu 2>/dev/null)
+    if [ "$username" ]; then
+        name=$(getent passwd $username 2>/dev/null|cut -d: -f5|cut -d, -f1)
+        [ -z "$name" ] && name=$username
+    fi
+    name=$(from_locale "$name")
+    cat <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<!-- OPML generated by Podsh v$VERSION -->
+<opml version="1.1">
+  <head>
+    <title>${name}'s podcast subscriptions</title>
+    <dateCreated>$(LC_TIME=C date +"$RFC2822_TIMESTAMP_FORMAT")</dateCreated>
+    <ownerName>$name</ownerName>
+  </head>
+  <body>
+EOF
+    while read url title; do
+        [ "${url:0:4}" = 'http' ] || continue
+        titlexml=${title//&/&amp;}
+        titlexml=${titlexml//</&lt;}; titlexml=${titlexml//>/&gt;}; titlexml=${titlexml//\"/&quot;}
+        xmlUrl=${url//&/&amp;}
+        xmlUrl=${xmlUrl//</&lt;}; xmlUrl=${xmlUrl//>/&gt;}; xmlUrl=${xmlUrl//\"/&quot;}
+        echo "    <outline type=\"rss\" text=\"${titlexml}\"
+                        xmlUrl=\"${xmlUrl}\" />"
+    done < "$CONFIG"
+cat <<EOF
+  </body>
+</opml>
+EOF
+}
+
+# Tries to parse date given in argument 1 and outputs result
+# formatted as argument 2
+parse_date() {
+    local input=$1 format=$2 parsed
+    parsed=$(date -d "$input" +"$format" 2>/dev/null)
+    if [ $? -eq 0 ]; then
+        echo -n "$parsed"
+        return 0
+    fi
+
+    # Might be RFC 3339 format for Atom feeds, make it parseable by date command
+    input=$(echo "$input"|sed -e 's/T/ /' -e 's/\.[0-9][0-9]//' -e 's/\([+-][0-9][0-9]:[0-9][0-9]\)/ \1/')
+    parsed=$(date -d "$input" +"$format" 2>/dev/null)
+    if [ $? -eq 0 ]; then
+        echo -n "$parsed"
+        return 0
+    fi
+
+    return 1
+}
+
+# Encodes a UTF-8 string to current locale, falls back to no re-encoding if
+# iconv fails.
+to_locale() {
+    local lenc
+    lenc=$(echo "$@"|iconv -f UTF-8 2>/dev/null)
+    [ $? -eq 0 ] && echo "$lenc" || echo "$@"
+}
+# Encodes a string in locale encoding to UTF-8, falls back to no re-encoding if
+# iconv fails.
+from_locale() {
+    local uenc
+    uenc=$(echo "$@"|iconv -t UTF-8 2>/dev/null)
+    [ $? -eq 0 ] && echo "$uenc" || echo "$@"
+}
+
+# Remove chars which are generally bad in filenames
+get_safe_filename() {
+    echo "$1"|tr -d "[<>\"'\$;:.\!*/?#%|\\&\t]"
+}
+
+# Map content-type of most command podcast formats to file extension.
+get_filename_ext_from_content_type() {
+    case $1 in
+        audio/mpeg) echo mp3 ;;
+        audio/mp4|*aac*|*x-m4a*) echo m4a ;;
+        *ogg*) echo ogg ;;
+        *wma*) echo wma ;;
+        *mp4*) echo mp4 ;;
+        *x-m4v*) echo m4v ;;
+        *quicktime*) echo mov ;;
+        *mpeg*) echo mpg ;;
+        *x-ms-wmv*) echo wmv ;;
+        *msvideo*) echo avi ;;
+        *matroska*) echo mkv ;;
+        *pdf*) echo pdf ;;
+        *wav*) echo wav ;;
+        *) return 1 ;;
+    esac
+}
+
+# Echoes '<effective-url>\n<content-type>\n' for the given URL
+curl_get_effective_url_and_content_type() {
+    curl $CURL_COMMON_OPTS $CURL_SHORT_DELAY_OPTS --head  \
+         -w '%{url_effective}\n%{content_type}\n' "$1" 2>/dev/null | tail -n2
+}
+
+# Resolve a local file name from enclosure file URL.
+# Parameters: url, content-type, guid, item title, timestamp
+generate_filename() {
+    local url="$1" content_type="$2" guid="$3" itemtitle="$4" timestamp="$5"
+    local fn= effective_url
+    itemtitle=$(get_safe_filename "$itemtitle")
+
+    if [ "$itemtitle" ]; then
+        if [ -z "$content_type" ]; then
+            # No content type info in feed item data, check web server content type for the enclosure-URL
+            content_type=$(curl_get_effective_url_and_content_type "$url"|tail -n1)
+        fi
+        local ext
+        ext=$(get_filename_ext_from_content_type "$content_type")
+        [ $? -eq 0 ] && fn="${itemtitle}.${ext}"
+    fi
+
+    if [ -z "$fn" ]; then
+        # No title provided for feed item, try to get filename from URL instead.
+        effective_url=$(curl_get_effective_url_and_content_type "$url"|head -n1)
+        fn=${effective_url##*/}
+        fn=${fn%%\?*}; fn=${fn//%20/ }; fn=${fn//+/ }
+    fi
+
+    if [ -z "$fn" ]; then
+        # Fallback to hashing the guid, so we have something consistent to name
+        # the local file. Could try to extract tag information from media file
+        # here, but don't want to add a dependency on some tagging utility/library,
+        # which will only very rarely be needed.
+        local hash=5381 x
+        for x in $(echo -n "$guid"|od -t u1|sed -e 's/[^ ]*//'); do
+            ((hash = hash * 33 + hash + x))
+        done
+        fn="$((hash % 999919999)).unknown"
+    fi
+
+    [ "$timestamp" ] && fn="$timestamp-$fn"
+
+    echo "$fn"
+}
+
+# Check up config file
+init_cachedir_and_config() {
+    local created=
+    if ! [ -d "$CACHEDIR" ]; then
+        mkdir -p "$CACHEDIR" && created=1
+    fi
+
+    cd "$CACHEDIR" || { echo "Error: Could not enter download directory: $CACHEDIR"; return 1; }
+    CACHEDIR=$PWD
+    cd "$OLDPWD"
+
+    if [ "$created" ]; then
+        echo "$NAME download directory created: $CACHEDIR"
+    fi
+
+    if ! [ -w "$CACHEDIR" ]; then
+        echo "Error: Download directory not writable: $CACHEDIR"
+        return 1
+    fi
+    readonly CACHEDIR
+
+    CONFIG="$CACHEDIR/$CONFIG_FILENAME"
+
+    if ! [ -f "$CONFIG" ]; then
+        cat > "$CONFIG" <<EOF
+# $NAME configuration
+# -*- coding: utf-8 -*-
+# Comments start with '#', file should be UTF-8-encoded.
+# Feed entry format: 'URL [title]' per line (title is optional).
+#http://www.acoustica.com/mixcraft/tutorial/podcast/example-podcast.xml  Cleaning Office Podcast
+EOF
+        echo "$NAME configuration file created: $CONFIG"
+        echo
+    fi
+    readonly CONFIG
+}
+
+# Prevent multiple instances running on same cachedir simulatenously. This check
+# is done because we will typically be run from cron. This function will print
+# an error message and exit 100 if an existing lock file is found. Otherwise 0
+# is returned and lock file is claimed.
+check_and_claim_cachedir_lock() {
+    local lockfile="$CACHEDIR/.lock" pid
+    
+    (set -C; echo -n "$$" > "$lockfile") 2>/dev/null
+    if [ $? -eq 0 ]; then
+        # We got the lock, make sure that lock is cleaned up when we exit
+        trap "/bin/rm -f \"$lockfile\"" INT EXIT TERM
+        return 0
+    else
+        pid=$(<"$lockfile")
+        echo "Error: some other $NAME process is already running in dir"
+        echo "$CACHEDIR, check PID $pid. If that PID is invalid,"
+        echo "remove the lock file $lockfile and try again."
+        exit 100
+    fi
+}
+
+# Add a feed to config, avoid creating duplicates.
+# Params:
+# $1 URL, [$2 TITLE]
+# Return codes:
+# 0 OK, added or title updated.
+# 1 Something is invalid or config not updated.
+# 255 no config file.
+config_add_feed() {
+    local url="$1" title="$2" comment="$3"
+    [ -f "$CONFIG" ] || return 255
+
+    if [ "${url:0:4}" != 'http' ]; then
+        echo "Error: feed URL must begin with 'http'"
+        return 1
+    fi
+
+    if [ -z "$title" ]; then
+        local feedtmpfile="$CACHEDIR/.feed.tmp"
+        echo "Title not provided, checking title in feed."
+        curl $CURL_COMMON_OPTS $CURL_SHORT_DELAY_OPTS -o "$feedtmpfile" "$url" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            if ! xml_is_valid_feed "$feedtmpfile"; then
+                echo "Warning: invalid or non-RSS XML data in feed at $url"
+            else
+                title=$(xml_get_channel_title "$feedtmpfile")
+                to_locale "Extracted feed title: $title"
+            fi
+        fi
+        rm -f "$feedtmpfile"
+    fi
+
+    local retcode
+    (
+        encountered=
+        modified=
+        while read conf_url conf_title; do
+            if [ "$url" != "$conf_url" ]; then
+                if [ "${conf_url:0:4}" = 'http' ]; then
+                    echo "$conf_url$TAB$conf_title"
+                else
+                    echo "$conf_url${conf_title:+ $conf_title}"
+                fi
+                continue
+            else
+                if [ "$encountered" ]; then
+                    continue # already encountered in config, just skip.
+                fi
+
+                if [ "$title" != "$conf_title" ]; then
+                    # Title update on existing feed
+                    echo "$conf_url$TAB$title"
+                    modified=1
+                else
+                    echo "$conf_url$TAB$conf_title"
+                fi
+                encountered=1
+            fi
+        done
+        if [ -z "$encountered" ]; then
+            modified=1
+            if [ "$comment" ]; then
+                echo "# $comment"
+            fi
+            echo "$url$TAB$title"
+        fi
+        [ "$modified" ] && exit 0 || exit 1
+    ) < "$CONFIG" > "${CONFIG}.updated"
+    retcode=$?
+
+    mv -f "${CONFIG}.updated" "$CONFIG"
+    return $retcode
+}
+
+# Remove a feed from config.
+# Params:
+# $1 match (match in URL or title)
+# Return codes:
+# 0 OK removed, 1 something is invalid or not found, 255 no config file.
+config_remove_feed() {
+    local url="$1"
+    if ! [ -f "$CONFIG" ]; then return 255; fi
+
+    if [ "${url:0:4}" != 'http' ]; then
+        echo "Error: feed URL must begin with 'http'"
+        return 1
+    fi
+    
+    (
+        modified=
+        opmlcomment= # handle removing of any auto-generated import-comments in config.
+        while read conf_url conf_title; do
+            if [ "$url" = "$conf_url" ]; then 
+                modified=1
+                opmlcomment=
+                continue
+            else
+                if [ "$opmlcomment" ]; then
+                    echo "$opmlcomment"
+                    opmlcomment=
+                fi
+            fi
+
+            if [ "${conf_url:0:4}" = http ]; then
+                echo "$conf_url$TAB$conf_title"
+            else
+                if [ "${conf_title:0:18}"  = "$OPML_IMPORT_CONFIG_COMMNENT" ]; then
+                    opmlcomment="$conf_url${conf_title:+ $conf_title}"
+                else
+                    echo "$conf_url${conf_title:+ $conf_title}"
+                fi
+            fi
+        done
+        if [ "$opmlcomment" ]; then
+            echo "$opmlcomment"
+        fi
+        
+        if [ "$modified" ]; then
+            exit 0
+        else
+            exit 1
+        fi
+    ) < "$CONFIG" > "${CONFIG}.updated"
+    local retcode=$?
+    mv -f "${CONFIG}.updated" "$CONFIG"
+    return $retcode
+}
+
+# Generates an M3U playlist encoded in CP1252 (according to
+# "spec" at http://en.wikipedia.org/wiki/M3u) or an M3U8-list (UTF-8).
+# Params:
+# 1 feed cache dir
+# 2 If non-null, then create a unicode m3u8 playlist.
+generate_playlist() {
+    local dir="$1" unicode="$2"
+    local playlistext=.m3u
+    local encoding=CP1252
+    [ "$unicode" ] && { playlistext=.m3u8; encoding=UTF-8; }
+
+    local playlist="$dir/$(basename -- "$dir")$playlistext"
+    local enclosuredb="$dir/.enclosuredb"
+    rm -f "$dir"/*.m3u*
+
+    # Generate an m3u playlist with oldest first, by file name sorting.
+    echo -ne "#EXTM3U\r\n" > "$playlist"
+    # reverse order of files voodoo (we want oldest first in playlist, while enclosuredb is always newest first)
+    enclosure_db_get_files "$enclosuredb"|while c=0 read f; do echo "$((c++))	$f"; done|sort -nr|cut -f2-|while read file; do
+        [ -f "$dir/$file" ] || continue
+        local title=$(enclosure_db_get_title_for_file "$enclosuredb" "$file")
+        if [ -z "$title" ]; then
+            title=${file%.*}
+        fi
+
+        # Try to convert title to CP1252, if possible.
+        local conv=$(echo "$title"|iconv -f UTF-8 -t $encoding 2>/dev/null)
+        if [ $? -eq 0 ] && [ "$conv" ]; then
+            title="$conv"
+        else
+            rm -f "$playlist"
+            exit 1
+        fi
+
+        # Try to convert filename (filename is encoded according to current locale)
+        conv=$(echo "$file"|iconv -t $encoding 2>/dev/null)
+        if [ $? -eq 0 ] && [ "$conv" ]; then
+            file="$conv"
+        else
+            rm -f "$playlist"
+            exit 1
+        fi
+
+        echo -en "#EXTINF:-1,$title\r\n" >> "$playlist"
+        echo -en "$file\r\n" >> "$playlist"
+    done
+    retcode=$?
+    if [ $retcode -eq 0 ]; then
+        echo "Refreshed playlist: $(basename -- "$dir")/$(basename -- "$dir")$playlistext"
+    else
+        return $retcode
+    fi
+}
+
+# Some small helper functions for maintaing a simple enclosure-db
+enclosure_db_init() {
+    local db="$1"
+    touch "$db"
+    rm -f "${db}.new"
+}
+enclosure_db_get_files() {
+    local db="$1"
+    while IFS=$TAB read guid file title; do
+        echo "$file"
+    done < "$db"
+}
+enclosure_db_get_title_for_file() {
+    local db="$1" file="$2"
+    grep -m1 -F "$file" "$db"|cut -f3-
+}
+enclosure_db_get_file() {
+    local db="$1" guid="$2"
+    grep -m1 -F "{{${guid}}}" "$db"|cut -f2
+}
+enclosure_db_update() {
+    local db="$1" guid="$2" fn="$3" title="$4"
+    while IFS=$TAB read dbguid dbfile dbtitle; do
+        if [ "{{${guid}}}" = "$dbguid" ]; then # update
+            echo "${dbguid}${TAB}${fn}${TAB}${title}"
+        else
+            echo "${dbguid}${TAB}${dbfile}${TAB}${dbtitle}"
+        fi
+    done < "$db" > "${db}.updated"
+    mv -f "${db}.updated" "$db"
+}
+# Filename should be encoded according to current locale, title always in UTF-8.
+enclosure_db_register_new() {
+    local db="$1" guid="$2" fn="$3" title="$4"
+    echo "{{${guid}}}${TAB}${fn}${TAB}${title}" >> "${db}.new"
+}
+enclosure_db_commit_new() {
+    local db="$1"
+    [ -f "${db}.new" ] || return 0 # nothing new to commit.
+    cat "${db}.new" "$db" > "${db}.updated"
+    mv -f "${db}.updated" "$db"
+    rm -f "${db}.new"
+}
+
+# Do update of feeds
+update_feeds() {
+    local retcode
+    # Read from tmp-file, because config might be modified during update.
+    cp -f "$CONFIG" "${CONFIG}.readtmp"
+
+    ( # start a subshell
+    havefeeds=
+    while read conf_url conf_title; do
+        [ "${conf_url:0:4}" = 'http' ] || continue
+        havefeeds=1
+
+        if [ "$UPDATE_FILTER" ]; then
+            to_locale "$conf_url$conf_title"|grep -qiE -- "$UPDATE_FILTER" || continue
+        fi
+
+        feedtmpfile="$CACHEDIR/.feed.tmp"
+        to_locale "${conf_title:+$conf_title	}[$conf_url]"
+        curl $CURL_COMMON_OPTS $CURL_FEED_DELAY_OPTS -o "$feedtmpfile" "$conf_url" 2>/dev/null
+        retcode=$?
+
+        if [ $retcode -eq 130 ]; then
+            rm -f "${CONFIG}.readtmp"
+            exit 130 # curl was interrupted, we bail.
+        fi
+
+        if [ $retcode -ne 0 ]; then
+            echo "Warning: failed to download feed at $conf_url, skipping it."
+            rm -f "$feedtmpfile"
+            continue
+        fi
+        
+        if ! xml_is_valid_feed "$feedtmpfile"; then
+            echo "Warning: invalid or non-RSS XML data in feed at $conf_url, skipping it."
+            rm -f "$feedtmpfile"
+            continue
+        fi
+
+        feed_title="$conf_title"
+
+        if [ -z "$feed_title" ]; then
+            # No feed title set in config, try to extract from channel
+            feed_title=$(xml_get_channel_title "$feedtmpfile")
+
+            # Update config with feed title
+            config_add_feed "$conf_url" "$feed_title"
+            to_locale "Note: updated config with feed title: $feed_title"
+        fi
+
+        if [ "$feed_title" ]; then
+            feed_dir=$(get_safe_filename "$feed_title")
+            feed_dir=$(to_locale "$feed_dir")
+        else
+            echo "Warning: could not get feed title from channel and no title set in"
+            echo "         config. Feed will be skipped."
+            rm -f "$feedtmpfile"
+            continue
+        fi
+
+        if [ -z "$feed_dir" ]; then
+            to_locale "Warning: could not create a safe local feed directory name from title \`$feed_title'."
+            echo "         You should provide a title for this feed explicitly in the"
+            echo "         configuration. Feed will be skipped."
+            rm -f "$feedtmpfile"
+            continue
+        fi
+
+        # Set up some feed resources in local cache
+        cachedest="$CACHEDIR/$feed_dir"; mkdir -p "$cachedest"
+        enclosuredb="$cachedest/.enclosuredb"; enclosure_db_init "$enclosuredb"
+        echo "$conf_url$TAB$feed_title" > "$cachedest/.podshfeed"
+        dlcount=0; echo $dlcount > "$cachedest/.dlcount"
+
+        # Now loop over feed items and update local cache
+        itemcount=0
+        xml_get_channel_items "$feedtmpfile" | while IFS=$TAB read timestamp \
+                                                          enclosure_url \
+                                                          enclosure_url_type \
+                                                          itemtitle \
+                                                          guid; do # start of implicit subshell 2
+            # convert '?' (meaning unavailable) to empty/null.
+            [ "$timestamp" = '?' ] && timestamp=
+            [ "$enclosure_url" = '?' ] && enclosure_url=
+            [ "$enclosure_url_type" = '?' ] && enclosure_url_type=
+            [ "$itemtitle" = '?' ] && itemtitle=
+            [ "$guid" = '?' ] && guid=
+
+            download=1
+            filename=
+
+            if [ "${enclosure_url:0:4}" != 'http' ] && [ "${enclosure_url:0:4}" != 'HTTP' ]; then
+                echo "Warning: invalid or missing enclosure URL in feed item, skipping."
+                continue
+            fi
+
+            if [ -z "$guid" ]; then
+                guid="$enclosure_url" # fallback to enclosure URL as GUID when explicit GUID is missing in feed item.
+            fi
+
+            # Already seen this media file ?
+            dbfile=$(enclosure_db_get_file "$enclosuredb" "$guid")
+            if [ "$dbfile" ]; then
+                [ -f "$cachedest/$dbfile" ] && download= # already downloaded, unset download..
+            else
+                # Register new entry in enclosure-db
+                filename=$(generate_filename "$enclosure_url" "$enclosure_url_type" "$guid" "$itemtitle" "$timestamp")
+                filename=$(to_locale "$filename")
+                enclosure_db_register_new "$enclosuredb" "$guid" "$filename" "$itemtitle"
+            fi
+
+            # Download if necessary.
+            if [ "$download" ] && { [ -z "$LIMIT" ] || [ $itemcount -lt $LIMIT ]; }; then
+                if [ -z "$filename" ]; then
+                    filename=$(generate_filename "$enclosure_url" "$enclosure_url_type" "$guid" "$itemtitle" "$timestamp")
+                    filename=$(to_locale "$filename")
+                fi
+
+                # Refresh enclosure-db with data for file we are about to download.
+                enclosure_db_update "$enclosuredb" "$guid" "$filename" "$itemtitle"
+
+                echo "Downloading $enclosure_url"
+                if [ -t 1 ]; then
+                    curl $CURL_COMMON_OPTS --progress-bar $CURL_MEDIA_DELAY_OPTS -o "$cachedest/.download.tmp" "$enclosure_url"
+                    retcode=$?
+                else
+                    curl $CURL_COMMON_OPTS $CURL_MEDIA_DELAY_OPTS -o "$cachedest/.download.tmp" "$enclosure_url" 1>/dev/null 2>&1
+                    retcode=$?
+                fi
+
+                if [ $retcode -eq 130 ]; then rm -f "$cachedest/.download.tmp"; exit 130; fi
+
+                if [ $retcode -eq 0 ]; then
+                   # Save downloaded file
+                    mv -f "$cachedest/.download.tmp" "$cachedest/$filename"
+                    echo "Saved to: $feed_dir/$filename"
+                    dlcount=$((dlcount+1)); echo $dlcount > "$cachedest/.dlcount"
+                else
+                    echo "Warning: failed to download item enclosure at $enclosure_url"
+                    rm -f "$cachedest/.download.tmp"
+                fi
+            fi
+
+            # Update item count
+            itemcount=$((itemcount+1))
+        done # end of subshell 2
+        retcode=$?
+        rm -f "$feedtmpfile"
+        if [ $retcode -eq 130 ]; then exit 130; fi
+
+        # New entries must be added in one batch, this has to do with
+        # maintaining proper chronological order of entries.
+        enclosure_db_commit_new "$enclosuredb"
+
+        dlcount=$(<"$cachedest/.dlcount")
+        rm -f "$cachedest/.dlcount"
+        if [ $dlcount -eq 0 ]; then
+            echo "No new items downloaded."
+        else
+            echo "Downloaded $dlcount new item(s)"
+        fi
+
+        # Apply limit to number of items in local cache
+        if [ "$LIMIT" ] && [ "$EXPIRE" ]; then
+            # Enclosure-db is ordered from new to old.
+            # Note that this is only reliable if either feed has proper
+            # publication dates or the items in the feed are ordered from
+            # new to old.
+            count=1
+            enclosure_db_get_files "$enclosuredb"|while read file; do
+                if [ -f "$cachedest/$file" ]; then
+                    if [ $count -gt $LIMIT ]; then
+                        echo "Expiry: removing file: $feed_dir/$file"
+                        rm -f "$cachedest/$file"
+                    fi
+                    count=$((count + 1))
+                fi
+            done
+        fi
+
+        # Generate an m3u playlist with oldest first (fallback to .m3u8 in case
+        # of encoding-problems).
+        generate_playlist "$cachedest" || generate_playlist "$cachedest" utf8
+        echo
+    done
+    [ "$havefeeds" ] && exit 0 || exit 1
+
+    ) < "${CONFIG}.readtmp" # end of outer subshell
+    retcode=$?
+    rm -f "${CONFIG}.readtmp"
+    return $retcode
+}
+
+
+readonly OPML_IMPORT_CONFIG_COMMNENT="Imported from OPML"
+do_config_updates() {
+    local url title add updated= importfile
+
+    for importfile in "${IMPORTFILES[@]}"; do
+        local opmltitle=$(xml_get_opml_title "$importfile")
+        to_locale "Adding feeds found in OPML file: $importfile${opmltitle:+	[$opmltitle]}"
+        xml_get_opml_feeds "$importfile" | (
+            while IFS=$TAB read url title; do
+                to_locale "Adding podcast feed at $url${title:+	[$title]}"
+                config_add_feed "$url" "$title" \
+                    "$OPML_IMPORT_CONFIG_COMMNENT [${opmltitle:-$importfile}]:" && updated=1
+            done
+            [ "$updated" ] && exit 0 || exit 1
+        ) && updated=1
+        echo
+    done
+
+    for add in "${ADDS[@]}"; do
+        url=${add%%$TAB*}
+        title=${add#*$TAB}
+        
+        to_locale "Adding podcast feed at $url${title:+	[$title]}"
+        config_add_feed "$url" "$title" && updated=1
+        echo
+    done
+
+    # Removals
+    local remfile
+    for remfile in "${REMFILES[@]}"; do
+        local opmltitle=$(xml_get_opml_title "$remfile")
+        to_locale "Removing feeds found in OPML file: $remfile${opmltitle:+	[$opmltitle]}"
+        xml_get_opml_feeds "$remfile" | (
+            updated=
+            while read line; do
+                url="${line%%	*}"
+                echo "Removing podcast feed at $url"
+                config_remove_feed "$url" && updated=1
+            done
+            [ "$updated" ] && exit 0 || exit 1
+        ) && updated=1
+        echo
+    done
+
+    local match
+    for match in "${REMATCHES[@]}"; do
+        to_locale "Removing podcast feed(s) matching '$match'"
+        cp -f "$CONFIG" "${CONFIG}.readtmp"
+        (
+            updated=
+            while read conf_url conf_title; do
+                [ "${conf_url:0:4}" = 'http' ] || continue
+                if to_locale "$conf_url$conf_title"|grep -qiE -- "$match"; then
+                    to_locale "Removing podcast feed: $conf_title	[$conf_url]"
+                    config_remove_feed "$conf_url" && updated=1
+                fi
+            done
+            [ "$updated" ] && exit 0 || exit 1
+        ) < "${CONFIG}.readtmp" && updated=1
+        rm -f "${CONFIG}.readtmp"
+        echo
+    done
+    [ "$updated" ] && return 0 || return 1
+}
+
+do_config_status() {
+    [ -f "$CONFIG" ] || exit 255
+
+    echo "Download directory: $CACHEDIR"
+    echo
+    local feedtmpfile="$CACHEDIR/.feed.tmp"
+    while read conf_url conf_title; do
+        [ "${conf_url:0:4}" = 'http' ] || continue
+        to_locale "${conf_title:+$conf_title	}[$conf_url]"
+        if [ "$STATUS" ]; then
+            echo -n "Checking status .. "
+            curl $CURL_COMMON_OPTS $CURL_SHORT_DELAY_OPTS -o "$feedtmpfile" "$conf_url" 2>/dev/null
+            retcode=$?
+            if [ $retcode -eq 0 ]; then
+                if xml_is_valid_feed "$feedtmpfile"; then
+                    echo "OK"
+                else
+                    echo "failed: feed is not in proper format or not responding."
+                fi
+            elif [ $retcode -eq 130 ]; then
+                exit 130
+            else
+                echo "failed: unable to download feed."
+            fi
+
+            local feed_dir=$(get_safe_filename "$conf_title")
+            feed_dir=$(to_locale "$feed_dir")
+            if [ -f "$CACHEDIR/$feed_dir/.podshfeed" ]; then
+                echo "Local cache last updated:" $(LC_TIME=C date -r "$CACHEDIR/$feed_dir/.podshfeed" +"$RFC2822_TIMESTAMP_FORMAT")
+                local count=$(ls -1 "$CACHEDIR/$feed_dir/"|grep -Fv .m3u|wc -l)
+                echo "Number of downloaded items: $count"
+            else
+                echo "No local cache dir exists yet for this feed."
+            fi
+            echo
+        fi
+    done < "$CONFIG"
+    rm -f "$feedtmpfile"
+    [ "$STATUS" ] || echo
+    echo "Total number of podcast feeds configured:" $(grep -E '^http' "$CONFIG"|wc -l)
+    echo
+}
+
+# Remove stale/de-configured feeds from cache dir
+clean_local_cache() {
+    cd "$CACHEDIR" || { echo "Error: could not enter directory: $CACHEDIR, cannot do cleanup."; exit 255; }
+    ls -1 | while read dir; do
+        if [ -f "$dir/.podshfeed" ] ; then
+            stale=
+            feed_url=$(cut -f1 "$dir/.podshfeed")
+            feed_title=$(cut -f2- "$dir/.podshfeed")
+            feed_dir=$(get_safe_filename "$feed_title")
+            feed_dir=$(to_locale "$feed_dir")
+            
+            if [ "$feed_dir" != "$dir" ]; then
+                stale=1
+            else
+                (
+                    while read conf_url conf_title; do
+                        if [ "$conf_url" = "$feed_url" ]; then
+                            if [ "$conf_title" != "$feed_title" ]; then
+                                exit 1
+                            else
+                                exit 0
+                            fi
+                        fi
+                    done
+                    exit 1 # not found in config
+                ) < "$CONFIG" || stale=1
+            fi
+
+            if [ "$stale" ]; then
+                # OK, remove it or notify about it.
+                if [ -z "$CLEAN" ]; then
+                    echo "Found a stale podcast in local cache: $CACHEDIR/$dir"
+                    echo "Use -X to delete."
+                else
+                    echo "Deleting stale feed from cache: $CACHEDIR/$dir"
+                    enclosure_db_get_files "$dir/.enclosuredb"|while read file; do
+                        rm -f "$dir/$file"
+                    done
+                    rm -f "$dir"/*.m3u* "$dir"/.enclosuredb* "$dir"/.podshfeed "$dir"/.download*
+                    if ! rmdir "$dir" 2>/dev/null; then
+                        echo "Warning: could not remove directory."
+                        echo "         Something not generated by $NAME is probably left there."
+                    fi
+                fi
+                echo
+            fi
+        fi
+    done
+}
+
+print_usage() {
+    cat <<EOF
+Use: $CMD [options]
+
+Options:
+-u [MATCH]
+    Update all podcasts. Optionally specify a regular expression MATCH to only
+    update feeds matching in title or URL.
+
+-l N
+    Limit number of downloaded entries per podcast to N. Default limit is 1;
+    only download the most recent episode. Set to -1 for unlimited.
+    Applies only when updating feeds.
+
+-e  Expire old items/episodes according to limit set with -l N. If the number of
+    items in the feed download dir exceeds the limit N, then the oldest files
+    will be deleted. Applies only when updating feeds.
+
+-a URL [title] or OPML-FILE
+    Add feed at URL. Optionally specify the desired title. If an OPML file is
+    specified instead of a URL, then all feeds found in that file are imported.
+
+-r MATCH or OPML-FILE
+    Remove feeds matching MATCH in URL or title. If an OPML file is specified,
+    then all feeds found in that file are removed. Use -X to delete the local
+    download dir associated with the feed(s) as well.
+
+-O OPML-FILE
+    Export current podcast subscriptions as XML to an OPML-file.
+
+-X  Clean up local download dir by deleting podcasts that are no longer
+    configured. Useful if you have removed podcasts from the config and would
+    like to clean up.
+
+-d DOWNLOAD-DIR
+    Set the download directory. Can also be set through the environment variable
+    \`PODSH_DOWNLOAD_DIR'.
+    Default is: $CACHEDIR_DEFAULT
+
+    Note: The feed configuration will be stored in a file \`$CONFIG_FILENAME'
+    under this directory.
+
+-s  Print list of subscribed podcasts.
+-S  Print subscribed podcasts and check their status.
+
+-h  Show this help.
+
+-V  Show version.
+
+Examples:
+Add a couple of feeds to config:
+\$ $CMD -a http://somewhere.com/feed.rss -a http://foo.feed.com/?rss "Foo Feed"
+
+Update all feeds, download only the most recents item for each feed:
+\$ $CMD -u
+
+Update feeds matching 'bbc', download and keep at most 5 items for each
+feed, older items are expired:
+\$ $CMD -u bbc -l5 -e
+
+Remove feeds from config matching 'bbc.co.uk' and delete them from local cache:
+\$ $CMD -r bbc.co.uk -X
+EOF
+}
+
+# Options w/defaults
+readonly CACHEDIR_DEFAULT="$HOME/Podcasts"
+readonly CONFIG_FILENAME=".feeds.conf"
+CACHEDIR=$PODSH_DOWNLOAD_DIR
+CONFIG=
+LIMIT=1 EXPIRE= CLEAN= IMPORTFILES=() REMFILES=() REMATCHES=()
+UPDATE= UPDATE_FILTER= STATUS= PRINT_SUBSCRIBED= ADDS=()
+ACTION= EXPOPML=
+
+while getopts ":a:r:ud:l:O:esSXhV" opt; do
+    case $opt in
+        u) 
+            UPDATE=1; ACTION=1
+            shift $((OPTIND-1)); OPTIND=1
+            if [ "${1:0:1}" != '-' ]; then
+                UPDATE_FILTER=$1
+                shift
+            fi
+            ;;
+        s) PRINT_SUBSCRIBED=1; ACTION=1 ;;    
+        S) PRINT_SUBSCRIBED=1; STATUS=1; ACTION=1 ;;
+        l)
+            if [ "$OPTARG" = '-1' ]; then
+                LIMIT=
+            elif echo $OPTARG|grep -qE '^[1-9][0-9]*$'; then
+                LIMIT=$OPTARG
+            else
+                echo "Error: option -l requires a numeric argument > 0 or -1 for unlimited"
+                exit 255
+            fi
+            ;;
+        e) EXPIRE=1 ;;
+        X) CLEAN=1; ACTION=1 ;;
+        a)
+            if [ -f "$OPTARG" ]; then
+                IMPORTFILES[${#IMPORTFILES[*]}]="$OPTARG"
+            else
+                title=
+                shift $((OPTIND-1)); OPTIND=1
+                if [ "${1:0:1}" != '-' ]; then
+                    title=$1
+                    shift
+                fi
+                title=$(from_locale "$title")
+                ADDS[${#ADDS[*]}]="$OPTARG$TAB$title"
+            fi
+            ACTION=1
+            ;;
+        r)
+            if [ -f "$OPTARG" ]; then
+                REMFILES[${#REMFILES[*]}]="$OPTARG"
+            else
+                REMATCHES[${#REMATCHES[*]}]="$OPTARG"
+            fi
+            ACTION=1
+            ;;
+        O) EXPOPML=$OPTARG; ACTION=1 ;;
+        d) CACHEDIR=$OPTARG ;;
+        h) print_usage; exit 0 ;;
+        V) to_locale "$NAME $VERSION${COMMIT:+ [git $COMMIT]}"
+           to_locale "Copyright (C) 2010-2013 Øyvind Stegard <oyvind.stegard@ifi.uio.no>"
+           exit 0
+           ;;
+        ?) echo "Error: unknown option \`$OPTARG'"; print_usage; exit 255 ;;
+    esac
+done
+
+echo "$NAME starting $(LC_TIME=C date +"$RFC2822_TIMESTAMP_FORMAT")"
+echo
+
+# Check some pre-requisites
+check_prerequisites
+
+# Boot-strap and init cache dir and config
+[ -z "$CACHEDIR" ] && CACHEDIR=$CACHEDIR_DEFAULT
+init_cachedir_and_config
+
+readonly LIMIT EXPIRE CLEAN IMPORTFILES REMFILES
+readonly UPDATE UPDATE_FILTER STATUS ADDS REMATCHES ACTION EXPOPML
+
+if [ -z "$ACTION" ]; then
+    echo "Nothing to do. Use -u to update podcasts and -h for help."
+    echo
+fi
+
+# Check cachedir lock and grab it or die.
+check_and_claim_cachedir_lock
+
+# Do any adds, removes or import of feeds
+do_config_updates && { echo "Config was updated."; echo; }
+
+# Do config status if requested
+if [ "$PRINT_SUBSCRIBED" ]; then
+    do_config_status
+    if [ $? -eq 130 ]; then
+        echo "Interrupted, exiting."
+        exit 130
+    fi
+fi
+
+# Do exports
+if [ "$EXPOPML" ]; then
+    echo "Exporting podcast subscriptions to OPML file: $EXPOPML"
+    xml_export_opml > "$EXPOPML" 2>/dev/null
+    echo 'Done.'
+    echo
+fi
+
+# Update feeds if requested
+if [ "$UPDATE" ]; then
+    echo "Updating podcasts${UPDATE_FILTER:+ matching '$UPDATE_FILTER'}"
+    echo
+    update_feeds; retcode=$?
+    if [ $retcode -eq 130 ]; then
+        echo "Interrupted, exiting."
+        exit 130
+    elif [ $retcode -eq 1 ]; then
+        echo "Oops, no podcast feeds have been configured yet."
+        echo "Use -a to add feeds and -h for help."
+        echo "You can also edit the config file directly: $CONFIG"
+        echo
+    fi
+fi
+
+# Clean cache
+clean_local_cache
+
+echo "$NAME finished $(LC_TIME=C date +"$RFC2822_TIMESTAMP_FORMAT")"
+
+exit 0
+
+# End of file.

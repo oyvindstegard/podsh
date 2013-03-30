@@ -1,9 +1,9 @@
 INSTALLATION INSTRUCTIONS
-
+=========================
 
 REQUIREMENTS
-
-Posh requires that you have the commands `curl' and `xsltproc' installed and
+------------
+Podsh requires that you have the commands `curl' and `xsltproc' installed and
 available in your PATH. These are available on most common distributions and
 operating systems (either already installed or available as packages).
 
@@ -12,8 +12,12 @@ the location differs in your installation).
 
 
 INSTALLATION PROCEDURE
+----------------------
+To install podsh, simply copy the script file named `podsh' to some directory in
+your PATH, for instance ~/bin/ or /usr/local/bin/. To also install the
+accompanying manual page, copy the file `podsh.1' to /usr/local/man/man1.
 
-To install posh, simply copy the script file named `posh' to some directory in
-your PATH, for instance ~/bin/ or /usr/local/bin/. 
+Then simply run:
+$ podsh -h
 
-Then simply run "posh -h" for help.
+for help.
