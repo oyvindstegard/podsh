@@ -1,0 +1,11 @@
+2012-07-22  Øyvind Stegard <oyvind.stegard@ifi.uio.no>
+
+        * Version 0.9.1: rework options '-s' and '-S'.
+
+2011-11-05  Øyvind Stegard  <oyvind.stegard@ifi.uio.no>
+
+	* Version 0.9: support Atom 1.0 feeds.
+
+2010-04-01  Øyvind Stegard  <oyvind.stegard@ifi.uio.no>
+
+	* Version 0.8: initial public release.
