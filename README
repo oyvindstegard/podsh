@@ -11,15 +11,16 @@ from cron), and you should be able to enjoy continuously updated podcast media
 files with minimal fuzz.
 
 Summary of features:
+--------------------
 
-- Few dependencies (bash, curl, xsltproc) - easy installation.
-- Robust feed fetching and parsing, tracking of downloaded content, proper
+* Few dependencies (bash, curl, xsltproc) - easy installation.
+* Robust feed fetching and parsing, tracking of downloaded content, proper
   chronological ordering, sensible naming of downloaded files (audio or video)
   and expiry support.
-- Supports both RSS and Atom 1.0 feeds.
-- Easy configuration and feed subscription management. Self documenting (help,
+* Supports both RSS and Atom 1.0 feeds.
+* Easy configuration and feed subscription management. Self documenting (help,
   -h).
-- OPML file support (import, delete, export).
-- Suitable to set up as a cron job for periodic automatic updating of podcasts
+* OPML file support (import, delete, export).
+* Suitable to set up as a cron job for periodic automatic updating of podcasts
   or interactive use.
 
