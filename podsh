@@ -73,7 +73,7 @@
 #
 
 readonly NAME=Podsh
-readonly VERSION=0.9.1
+readonly VERSION=0.9.2
 readonly COMMIT=$(echo '$Format:%H$'|grep -v Format)
 readonly CMD=$(basename -- $0)
 
@@ -1129,14 +1129,15 @@ LIMIT=1 EXPIRE= CLEAN= IMPORTFILES=() REMFILES=() REMATCHES=()
 UPDATE= UPDATE_FILTER= STATUS= PRINT_SUBSCRIBED= ADDS=()
 ACTION= EXPOPML=
 
-while getopts ":a:r:ud:l:O:esSXhV" opt; do
+while getopts ":a:r:u:d:l:O:esSXhV" opt; do
     case $opt in
         u)
             UPDATE=1; ACTION=1
-            shift $((OPTIND-1)); OPTIND=1
-            if [ "${1:0:1}" != '-' ]; then
-                UPDATE_FILTER=$1
-                shift
+            if [ "${OPTARG:0:1}" != '-' ]; then
+                UPDATE_FILTER=$OPTARG
+            else
+                OPTIND=$((OPTIND-1))
+                continue
             fi
             ;;
         s) PRINT_SUBSCRIBED=1; ACTION=1 ;;
@@ -1183,6 +1184,14 @@ while getopts ":a:r:ud:l:O:esSXhV" opt; do
            to_locale "Copyright (C) 2010-2013 Øyvind Stegard <oyvind.stegard@ifi.uio.no>"
            exit 0
            ;;
+        :)
+            if [ $OPTARG = u ]; then
+                UPDATE=1; ACTION=1
+            else
+                echo "Error: -$OPTARG option is missing required arg"
+                exit 255
+            fi
+            ;;
         ?) echo "Error: unknown option \`$OPTARG'"; print_usage; exit 255 ;;
     esac
 done
