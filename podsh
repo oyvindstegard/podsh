@@ -9,7 +9,7 @@
 #
 ################################################################################
 #                                   LICENSE
-# This program is free software: you can redistribute it and/or modify it under 
+# This program is free software: you can redistribute it and/or modify it under
 # the terms of the GNU General Public License as published by the Free Software
 # Foundation, either version 3 of the License, or (at your option) any later
 # version.
@@ -464,7 +464,7 @@ EOF
 # is returned and lock file is claimed.
 check_and_claim_cachedir_lock() {
     local lockfile="$CACHEDIR/.lock" pid
-    
+
     (set -C; echo -n "$$" > "$lockfile") 2>/dev/null
     if [ $? -eq 0 ]; then
         # We got the lock, make sure that lock is cleaned up when we exit
@@ -565,12 +565,12 @@ config_remove_feed() {
         echo "Error: feed URL must begin with 'http'"
         return 1
     fi
-    
+
     (
         modified=
         opmlcomment= # handle removing of any auto-generated import-comments in config.
         while read conf_url conf_title; do
-            if [ "$url" = "$conf_url" ]; then 
+            if [ "$url" = "$conf_url" ]; then
                 modified=1
                 opmlcomment=
                 continue
@@ -594,7 +594,7 @@ config_remove_feed() {
         if [ "$opmlcomment" ]; then
             echo "$opmlcomment"
         fi
-        
+
         if [ "$modified" ]; then
             exit 0
         else
@@ -735,7 +735,7 @@ update_feeds() {
             rm -f "$feedtmpfile"
             continue
         fi
-        
+
         if ! xml_is_valid_feed "$feedtmpfile"; then
             echo "Warning: invalid or non-RSS XML data in feed at $conf_url, skipping it."
             rm -f "$feedtmpfile"
@@ -918,7 +918,7 @@ do_config_updates() {
     for add in "${ADDS[@]}"; do
         url=${add%%$TAB*}
         title=${add#*$TAB}
-        
+
         to_locale "Adding podcast feed at $url${title:+	[$title]}"
         config_add_feed "$url" "$title" && updated=1
         echo
@@ -1015,7 +1015,7 @@ clean_local_cache() {
             feed_title=$(cut -f2- "$dir/.podshfeed")
             feed_dir=$(get_safe_filename "$feed_title")
             feed_dir=$(to_locale "$feed_dir")
-            
+
             if [ "$feed_dir" != "$dir" ]; then
                 stale=1
             else
@@ -1131,7 +1131,7 @@ ACTION= EXPOPML=
 
 while getopts ":a:r:ud:l:O:esSXhV" opt; do
     case $opt in
-        u) 
+        u)
             UPDATE=1; ACTION=1
             shift $((OPTIND-1)); OPTIND=1
             if [ "${1:0:1}" != '-' ]; then
@@ -1139,7 +1139,7 @@ while getopts ":a:r:ud:l:O:esSXhV" opt; do
                 shift
             fi
             ;;
-        s) PRINT_SUBSCRIBED=1; ACTION=1 ;;    
+        s) PRINT_SUBSCRIBED=1; ACTION=1 ;;
         S) PRINT_SUBSCRIBED=1; STATUS=1; ACTION=1 ;;
         l)
             if [ "$OPTARG" = '-1' ]; then
